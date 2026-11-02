@@ -1,3 +1,13 @@
+> **Play it with Asciiverse.** With [av](https://asciiverse.sh), the Asciiverse
+> client:
+>
+> ```
+> av install terminal-space-program
+> av play terminal-space-program
+> ```
+>
+> The original README follows.
+
 <a href="https://www.buymeacoffee.com/jasonfen"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="24" width="85"></a>
 
 # Terminal Space Program
