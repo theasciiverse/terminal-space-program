@@ -1,61 +1,94 @@
+# Builds Terminal Space Program for the Asciiverse catalog and as system
+# packages. Replaces upstream's goreleaser workflow of the same name, which
+# publishes to upstream's own Homebrew tap, Scoop bucket and Cloudsmith
+# repository and must not run here.
+#
+# For av: one archive per target, named <id>-<target>.tar.gz (Linux, macOS)
+# or .zip (Windows), plus a SHA256SUMS file, attached to a GitHub release
+# (hub/catalog/SCHEMA.md, release.source = "github").
+# For everyone else: .deb, .rpm, .apk and Arch packages from the same Linux
+# binaries, made by nfpm (asciiverse/nfpm.yaml).
+#
+# Tags look like v0.64.8-av.1: upstream's version, then our packaging
+# release. Pure Go with CGO off, so every target cross-compiles on one
+# Linux runner into a static binary. Windows ARM64 is left out, as
+# upstream leaves it out.
+
 name: release
 
 on:
   push:
-    tags:
-      - 'v*'
-      # Goreleaser only handles strict SemVer (vMAJOR.MINOR.PATCH).
-      # Four-part patch tags (vX.Y.Z.N) are checkpoint markers, not
-      # release-binary triggers — exclude them so the workflow stays
-      # green on minor patch tags like v0.8.6.1.
-      - '!v*.*.*.*'
+    tags: ["v*-av.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build and release"
+        required: true
+
+env:
+  ID: terminal-space-program
+  BIN: terminal-space-program
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
 
 jobs:
-  goreleaser:
-    name: goreleaser
-    runs-on: ubuntu-latest
+  release:
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ env.TAG }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
-          check-latest: true
-          cache: true
+          go-version-file: go.mod
 
-      - name: Run goreleaser
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
-        env:
-          # Creates the GitHub release + uploads archives (scoped to this repo).
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # PAT with contents:write on jasonfen/homebrew-tap and
-          # jasonfen/scoop-bucket — the default GITHUB_TOKEN can't push to
-          # other repos. Falls back to GITHUB_TOKEN if the secret is unset,
-          # so a release without the secret still publishes binaries (the
-          # cask/scoop steps will fail loudly rather than silently skip).
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
-
-      # apt/dnf/apk repos on Cloudsmith's open-source tier, so Linux users
-      # get upgrades from their package manager. GoReleaser's own Cloudsmith
-      # publisher is Pro-only, hence the CLI. Arch packages stay on the
-      # GitHub release (Cloudsmith has no pacman format).
-      - name: Push Linux packages to Cloudsmith
-        env:
-          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+      - name: Build
         run: |
-          pip install --quiet cloudsmith-cli
-          repo=jasonfen/terminal-space-program-pkgs
-          for f in dist/*.deb; do cloudsmith push deb "$repo/debian/any-version" "$f"; done
-          for f in dist/*.rpm; do cloudsmith push rpm "$repo/any-distro/any-version" "$f"; done
-          for f in dist/*.apk; do cloudsmith push alpine "$repo/alpine/any-version" "$f"; done
+          v="${TAG#v}"; export UPSTREAM="${v%%-av.*}"
+          mkdir -p dist
+          build() { # goos goarch target-triple
+            out="stage-$3"; mkdir -p "$out"
+            exe="$BIN"; [ "$1" = windows ] && exe="$BIN.exe"
+            CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath \
+              -ldflags "-s -w -X github.com/jasonfen/terminal-space-program/internal/version.Version=$UPSTREAM -X github.com/jasonfen/terminal-space-program/internal/version.Commit=$(git rev-parse --short HEAD)" \
+              -o "$out/$exe" ./cmd/terminal-space-program
+            cp LICENSE NOTICE.md README.md "$out/"
+            if [ "$1" = windows ]; then (cd "$out" && zip -q -r "../dist/$ID-$3.zip" .)
+            else tar -czf "dist/$ID-$3.tar.gz" -C "$out" .; fi
+          }
+          build linux   amd64 x86_64-unknown-linux-musl
+          build linux   arm64 aarch64-unknown-linux-musl
+          build darwin  amd64 x86_64-apple-darwin
+          build darwin  arm64 aarch64-apple-darwin
+          build windows amd64 x86_64-pc-windows-msvc
+          ls -l dist
+
+      - name: System packages
+        run: |
+          v="${TAG#v}"; export VERSION="${v%%-av.*}" RELEASE="${v##*-av.}"
+          for pair in amd64:x86_64 arm64:aarch64; do
+            export ARCH="${pair%%:*}"
+            rm -rf stage && cp -r "stage-${pair##*:}-unknown-linux-musl" stage
+            for p in deb rpm apk archlinux; do
+              docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+                -e VERSION -e RELEASE -e ARCH goreleaser/nfpm:v2.43.0 \
+                package --config asciiverse/nfpm.yaml --packager "$p" --target dist/
+            done
+          done
+          ls -l dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Terminal Space Program $TAG" \
+                 --notes "Terminal Space Program ${TAG%%-av.*} from github.com/jasonfen/terminal-space-program, built for the Asciiverse catalog, with .deb, .rpm, .apk and Arch packages. Changes from upstream: see PATCHES.md."
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber
